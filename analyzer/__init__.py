@@ -1,0 +1,1 @@
+"""C++ cyclomatic complexity analyzer."""

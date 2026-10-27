@@ -1,112 +1,104 @@
-﻿import re
+import re
+from collections import Counter
 from typing import Any
 
+import networkx as nx
+import tree_sitter_cpp
+from tree_sitter import Language, Parser
 
-CONTROL_KEYWORDS = {
-    "if", "for", "while", "switch", "catch"
-}
+from analyzer.cfg import build_function_graph
+from analyzer.complexity import calculate_complexity, risk_level
 
-
-def remove_comments_and_literals(source: str) -> str:
-    pattern = re.compile(
-        r'//[^\n]*'
-        r'|/\*[\s\S]*?\*/'
-        r'|R"([^ ()\\\t\r\n]{0,16})\([\s\S]*?\)\1"'
-        r'|"(?:\\.|[^"\\])*"'
-        r"|'(?:\\.|[^'\\])*'",
-        re.MULTILINE,
-    )
-
-    def replace(match: re.Match) -> str:
-        return re.sub(r'[^\n]', ' ', match.group(0))
-
-    return pattern.sub(replace, source)
+_PARSER = Parser(Language(tree_sitter_cpp.language()))
 
 
-def find_functions(source: str) -> list[dict[str, Any]]:
-    clean_source = remove_comments_and_literals(source)
+def _collapse(text: str) -> str:
+    return re.sub(r"\s+", " ", text).strip()
 
-    function_pattern = re.compile(
-        r'(?P<signature>'
-        r'(?:[A-Za-z_]\w*(?:\s*<[^;{}]*>)?[\s*&:<>]*\s+)+'
-        r'[A-Za-z_]\w*\s*'
-        r'\([^;{}]*\)\s*'
-        r'(?:const\s*)?(?:noexcept\s*)?'
-        r'(?:->\s*[\w:<>*&\s]+)?'
-        r')\{',
-        re.MULTILINE,
-    )
 
-    functions = []
+def _find_function_declarator(declarator):
+    """Walk through pointer / reference / parenthesized wrappers."""
+    while declarator is not None:
+        if declarator.type == "function_declarator":
+            inner = declarator.child_by_field_name("declarator")
+            if inner is not None and inner.type in (
+                "parenthesized_declarator",
+                "pointer_declarator",
+                "reference_declarator",
+            ):
+                declarator = inner
+                continue
+            return declarator
+        inner = declarator.child_by_field_name("declarator")
+        if inner is None and declarator.named_children:
+            inner = declarator.named_children[0]
+        declarator = inner
+    return None
 
-    for match in function_pattern.finditer(clean_source):
-        brace_start = match.end() - 1
-        depth = 0
-        brace_end = None
 
-        for index in range(brace_start, len(clean_source)):
-            if clean_source[index] == '{':
-                depth += 1
-            elif clean_source[index] == '}':
-                depth -= 1
+def _function_name(node) -> str:
+    declarator = _find_function_declarator(node.child_by_field_name("declarator"))
+    if declarator is None:
+        return "(unknown)"
+    name = declarator.child_by_field_name("declarator")
+    return _collapse(name.text.decode("utf-8", errors="replace")) if name else "(unknown)"
 
-                if depth == 0:
-                    brace_end = index
-                    break
 
-        if brace_end is None:
-            continue
+def _signature(node, body) -> str:
+    end = body.start_byte
+    for child in node.children:
+        if child.type == "field_initializer_list":
+            end = child.start_byte
+    raw = node.text[: end - node.start_byte].decode("utf-8", errors="replace")
+    return _collapse(raw)
 
-        signature = match.group("signature").strip()
-        name_match = re.search(r'([A-Za-z_]\w*)\s*\([^()]*\)\s*(?:const\b)?', signature)
 
-        if not name_match:
-            continue
-
-        name = name_match.group(1)
-
-        if name in CONTROL_KEYWORDS or name in {"switch", "catch"}:
-            continue
-
-        body = clean_source[brace_start + 1:brace_end]
-
-        functions.append({
-            "name": name,
-            "signature": signature,
-            "start_line": clean_source.count("\n", 0, match.start()) + 1,
-            "end_line": clean_source.count("\n", 0, brace_end) + 1,
-            "body": body,
-        })
-
-    return functions
+def _function_nodes(root):
+    """All function definitions, in source order (methods, templates, namespaces)."""
+    stack = [root]
+    while stack:
+        node = stack.pop()
+        if node.type == "function_definition":
+            yield node
+        stack.extend(reversed(node.children))
 
 
 def analyze_source(source: str) -> dict[str, Any]:
-    clean_source = remove_comments_and_literals(source)
-    functions = find_functions(source)
+    """Parse C++ source and return complexity and a control flow graph per function."""
+    tree = _PARSER.parse(source.encode("utf-8"))
 
-    decisions = []
+    functions = []
+    for node in _function_nodes(tree.root_node):
+        body = node.child_by_field_name("body")
+        if body is None or body.type not in ("compound_statement", "try_statement"):
+            continue  # "= default", "= delete" and similar have no body
 
-    for keyword in ("if", "for", "while", "case", "catch"):
-        for match in re.finditer(r'\b' + keyword + r'\b', clean_source):
-            decisions.append({
-                "type": keyword,
-                "line": clean_source.count("\n", 0, match.start()) + 1,
-            })
+        graph, decisions = build_function_graph(body)
+        complexity = calculate_complexity(
+            graph.number_of_nodes(),
+            graph.number_of_edges(),
+            nx.number_weakly_connected_components(graph),
+        )
 
-    logical_operators = []
+        functions.append(
+            {
+                "name": _function_name(node),
+                "signature": _signature(node, body),
+                "start_line": node.start_point[0] + 1,
+                "end_line": node.end_point[0] + 1,
+                "complexity": complexity,
+                "risk": risk_level(complexity),
+                "decisions": decisions,
+                "decision_counts": dict(Counter(d["type"] for d in decisions)),
+                "graph": graph,
+            }
+        )
 
-    for match in re.finditer(r'&&|\|\|', clean_source):
-        logical_operators.append({
-            "operator": match.group(0),
-            "line": clean_source.count("\n", 0, match.start()) + 1,
-        })
-
+    scores = [function["complexity"] for function in functions]
     return {
         "functions": functions,
-        "decisions": decisions,
-        "logical_operators": logical_operators,
         "function_count": len(functions),
-        "decision_count": len(decisions),
-        "logical_operator_count": len(logical_operators),
+        "max_complexity": max(scores) if scores else 0,
+        "average_complexity": round(sum(scores) / len(scores), 1) if scores else 0,
+        "has_syntax_errors": tree.root_node.has_error,
     }
